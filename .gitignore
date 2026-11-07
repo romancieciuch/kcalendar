@@ -1,0 +1,13 @@
+# Private application data (SQLite database and WAL files)
+/data/
+
+# Local configuration and logs
+.env
+.env.*
+*.log
+
+# Editor and operating system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
