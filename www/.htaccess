@@ -1,3 +1,3 @@
 Options -MultiViews
 RewriteEngine On
-RewriteRule ^(?:dzisiaj|kalendarz|produkty|ustawienia)/?$ index.html [L,QSA]
+RewriteRule ^(?:dzisiaj|kalendarz|produkty|aktywnosci|ustawienia)/?$ index.html [L,QSA]
