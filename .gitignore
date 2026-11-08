@@ -1,4 +1,4 @@
-# Private application data (SQLite database and WAL files)
+# Private application data (accounts, sessions, JSON files and database backups)
 /data/
 
 # Local configuration and logs

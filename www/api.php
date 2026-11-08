@@ -13,6 +13,8 @@ if (!is_dir($base)) { mkdir($base, 0700, true); }
 $db = new PDO('sqlite:' . $base . DIRECTORY_SEPARATOR . 'kcalendar.sqlite');
 $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
 $db->exec('PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, salt TEXT NOT NULL, verifier TEXT NOT NULL, data TEXT NOT NULL DEFAULT "{}"); CREATE TABLE IF NOT EXISTS challenges (nonce TEXT PRIMARY KEY, username TEXT NOT NULL, expires INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS sessions (token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires INTEGER NOT NULL);');
+require_once __DIR__ . '/data_store.php';
+prepareDataStore($db, $base);
 function out(array $v, int $code=200): never { http_response_code($code); echo json_encode($v, JSON_UNESCAPED_UNICODE|JSON_INVALID_UTF8_SUBSTITUTE); exit; }
 $in=json_decode(file_get_contents('php://input') ?: '{}',true) ?: [];
 $action=$_GET['action'] ?? '';
@@ -36,24 +38,61 @@ if ($action==='auth') {
     $validProof=$row&&$nonceBytes!==false&&$authKey!==false&&(hash_equals(hash_hmac('sha256',$nonceBytes,$authKey),$proof)||hash_equals(hash_hmac('sha256',$nonceBytes,(string)$row['verifier']),$proof));
     if(!$row||$row['expires']<time()||!$validProof)out(['ok'=>false,'error'=>'Nieprawidłowy login lub hasło'],401);$id=(int)$row['id'];
   } else out(['ok'=>false,'error'=>'Nieprawidłowe żądanie'],400);
-  $token=bin2hex(random_bytes(32));$q=$db->prepare('INSERT INTO sessions VALUES(?,?,?)');$q->execute([hash('sha256',$token),$id,time()+60*60*24*30]);out(['ok'=>true,'token'=>$token]);
+  $uuid=migrateUserData($db,$base,$id);$token=bin2hex(random_bytes(32));$q=$db->prepare('INSERT INTO sessions VALUES(?,?,?)');$q->execute([hash('sha256',$token),$id,time()+60*60*24*30]);out(['ok'=>true,'token'=>$token,'uuid'=>$uuid]);
 }
-$token=(string)($in['token']??'');$q=$db->prepare('SELECT u.id,u.username,u.data,s.expires FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?');$q->execute([hash('sha256',$token)]);$user=$q->fetch(PDO::FETCH_ASSOC);
+$token=(string)($in['token']??'');$q=$db->prepare('SELECT u.id,u.username,u.data_uuid,s.expires FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=?');$q->execute([hash('sha256',$token)]);$user=$q->fetch(PDO::FETCH_ASSOC);
 if(!$user||$user['expires']<time())out(['ok'=>false,'error'=>'Sesja wygasła'],401);
 if($action==='logout') { $db->prepare('DELETE FROM sessions WHERE token_hash=?')->execute([hash('sha256',$token)]); out(['ok'=>true]); }
-if($action==='load')out(['ok'=>true,'user'=>$user['username'],'data'=>json_decode($user['data'],true) ?: ['foods'=>[],'meals'=>[],'days'=>[]]]);
-if($action==='save_day') {
-  $date=(string)($in['date']??''); $day=$in['day']??null;
-  if(!preg_match('/^\d{4}-\d{2}-\d{2}$/',$date)||!is_array($day)||!is_array($day['meals']??null)||!is_array($day['activities']??null)) out(['ok'=>false,'error'=>'Nieprawidłowe dane dnia'],400);
-  try {
-    $db->exec('BEGIN IMMEDIATE');
-    $q=$db->prepare('SELECT data FROM users WHERE id=?'); $q->execute([(int)$user['id']]);
-    $data=json_decode((string)$q->fetchColumn(),true) ?: ['foods'=>[],'meals'=>[],'days'=>[]];
-    if(!is_array($data['days']??null)) $data['days']=[];
-    $data['days'][$date]=['meals'=>$day['meals'],'activities'=>$day['activities']];
-    $q=$db->prepare('UPDATE users SET data=? WHERE id=?'); $q->execute([json_encode($data,JSON_UNESCAPED_UNICODE|JSON_INVALID_UTF8_SUBSTITUTE),(int)$user['id']]);
-    $db->exec('COMMIT'); out(['ok'=>true,'day'=>$data['days'][$date]]);
-  } catch(Throwable $e) { if($db->inTransaction()) $db->exec('ROLLBACK'); out(['ok'=>false,'error'=>'Nie udało się zapisać dnia'],500); }
+$uuid=(string)($user['data_uuid']??'');
+try {if($uuid===''||!is_file(dataFilePath($base,$uuid)))$uuid=migrateUserData($db,$base,(int)$user['id']);}
+catch(Throwable $e){out(['ok'=>false,'error'=>'Nie udało się przygotować danych konta'],500);}
+try {$document=readDataFile(dataFilePath($base,$uuid));}catch(Throwable $e){out(['ok'=>false,'error'=>'Nie udało się odczytać danych konta'],500);}
+if($action==='status')out(['ok'=>true,'user'=>$user['username'],'uuid'=>$uuid,'revision'=>$document['revision'],'updatedAt'=>$document['updatedAt']]);
+if($action==='load'){
+  $data=$document['data'];
+  if(isset($data['days'])&&is_array($data['days'])&&$data['days']===[])$data['days']=(object)[];
+  out(['ok'=>true,'user'=>$user['username'],'uuid'=>$uuid,'revision'=>$document['revision'],'updatedAt'=>$document['updatedAt'],'data'=>$data]);
 }
-if($action==='save') { $data=$in['data']??null;if(!is_array($data))out(['ok'=>false,'error'=>'Nieprawidłowe dane'],400);$q=$db->prepare('UPDATE users SET data=? WHERE id=?');$q->execute([json_encode($data,JSON_UNESCAPED_UNICODE|JSON_INVALID_UTF8_SUBSTITUTE),(int)$user['id']]);out(['ok'=>true]); }
+if($action==='export') {
+  $start=(string)($in['start']??''); $end=(string)($in['end']??'');
+  $from=DateTimeImmutable::createFromFormat('!Y-m-d',$start); $to=DateTimeImmutable::createFromFormat('!Y-m-d',$end);
+  if(!$from||!$to||$from->format('Y-m-d')!==$start||$to->format('Y-m-d')!==$end||$from>$to||$from->diff($to)->days>3652)
+    out(['ok'=>false,'error'=>'Wybierz poprawny zakres dat (maksymalnie 10 lat)'],400);
+  $path=tempnam($base,'kcalendar_export_');
+  if($path===false)out(['ok'=>false,'error'=>'Nie udało się przygotować eksportu'],500);
+  try {
+    require_once __DIR__ . '/export_xlsx.php';
+    buildExportXlsx($document['data'],$from,$to,$path);
+    header('Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    header('Content-Disposition: attachment; filename="kcalendar_'.$start.'_'.$end.'.xlsx"');
+    header('Content-Length: '.filesize($path));
+    readfile($path);
+  } catch(Throwable $e) {
+    @unlink($path);
+    out(['ok'=>false,'error'=>'Nie udało się przygotować pliku XLSX'],500);
+  }
+  @unlink($path); exit;
+}
+if($action==='save_day') {
+  $date=(string)($in['date']??''); $day=$in['day']??null; $revision=$in['revision']??null;
+  if(!preg_match('/^\d{4}-\d{2}-\d{2}$/',$date)||!is_array($day)||!is_array($day['meals']??null)||!is_array($day['activities']??null)||!is_int($revision)) out(['ok'=>false,'error'=>'Nieprawidłowe dane dnia'],400);
+  try {
+    $result=updateUserData($base,$uuid,$revision,static function(array $data) use($date,$day): array {
+      if(!is_array($data['days']??null)) $data['days']=[];
+      $data['days'][$date]=['meals'=>$day['meals'],'activities'=>$day['activities']];
+      return $data;
+    });
+    if(isset($result['conflict']))out(['ok'=>false,'error'=>'Dane na serwerze są nowsze','revision'=>$result['revision'],'updatedAt'=>$result['updatedAt']],409);
+    out($result);
+  } catch(Throwable $e) {out(['ok'=>false,'error'=>'Nie udało się zapisać dnia'],500);}
+}
+if($action==='save') {
+  $data=$in['data']??null; $revision=$in['revision']??null;
+  if(!is_array($data)||!is_int($revision))out(['ok'=>false,'error'=>'Nieprawidłowe dane'],400);
+  try {
+    $result=updateUserData($base,$uuid,$revision,static fn(array $current): array=>$data);
+    if(isset($result['conflict']))out(['ok'=>false,'error'=>'Dane na serwerze są nowsze','revision'=>$result['revision'],'updatedAt'=>$result['updatedAt']],409);
+    out($result);
+  } catch(Throwable $e) {out(['ok'=>false,'error'=>'Nie udało się zapisać danych'],500);}
+}
 out(['ok'=>false,'error'=>'Nieznana operacja'],404);
